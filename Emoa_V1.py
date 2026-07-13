@@ -80,10 +80,9 @@ def gspread_auth():
         "https://www.googleapis.com/auth/drive",
     ]
 
-    # Change from_service_account_file to from_service_account_info
-    # and pass the dictionary variable directly
+    # Use the pre-loaded dictionary directly instead of a file path
     creds = Credentials.from_service_account_info(
-        SERVICE_ACCOUNT_FILE,
+        SERVICE_ACCOUNT_FILE,  # Pass the loaded JSON dict here[cite: 1]
         scopes=scope
     )
 
@@ -241,7 +240,23 @@ def extract_main_objects(text: str) -> str:
     Overhauled sequential parser that cleanly targets the Objects clause
     using exact string positioning and structural token signals.
     """
-    lines = [line.strip() for line in text.split('\n')]
+    # Normalize continuous text structure to safeguard splits against dynamic space/newline errors
+    text_normalized = " ".join(text.split())
+    situation_anchor = "The registered office of the company will be situated in the State of"
+
+    # Process dynamically if the text contains the specific Situation Clause phrase
+    situation_idx = text_normalized.find(situation_anchor)
+    if situation_idx != -1:
+        # Extract text following the anchor phrase
+        clause_2_raw = text_normalized[situation_idx + len(situation_anchor):].strip()
+
+        # Look ahead for Clause 3 boundaries
+        objects_match = re.search(r'(3\s*\(a\)|3rd|III|The objects to be pursued)', clause_2_raw, re.IGNORECASE)
+        if objects_match:
+            # Drop the State segment entirely and continue from the Object breakdown point
+            text_normalized = clause_2_raw[objects_match.start():].strip()
+
+    lines = [line.strip() for line in text_normalized.split('\n')]
     FOOTER_PATTERN = re.compile(r'^PAGE\s+\d+\s+OF\s+\d+', re.IGNORECASE)
 
     # === 1. New INC-33 Format ===
@@ -264,11 +279,9 @@ def extract_main_objects(text: str) -> str:
                 num = int(match.group(1))
                 if num == 1:
                     if len(tracked_numbers) > 0:
-                        # Condition 1: Numbering restarts at 1
                         stop_idx = i
                         break
                     else:
-                        # Condition 2: First "1." found after generous gap
                         if (i - start_idx) > NO_NUMERIC_3A_GAP_THRESHOLD:
                             stop_idx = i
                             break
@@ -550,7 +563,7 @@ def process_sheet():
                         for d in pending[cin]:
                             new_extraction_values[d["row"]] = SKIPPED_EXTRACTION_TEXT
                             new_status_values[d["row"]] = STATUS_SKIPPED
-                    del pending[cin]
+                        del pending[cin]
 
             write_column_values(input_sheet, batch_start, batch_end, extraction_idx, chunk_rows, new_extraction_values,
                                 EXTRACTION_HEADER)
