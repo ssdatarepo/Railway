@@ -1,0 +1,8 @@
+gspread==6.2.1
+google-auth==2.49.1
+google-genai==2.6.0
+requests==2.32.5
+PyPDF2==3.0.1
+pymupdf==1.28.0
+pytesseract==0.3.13
+Pillow==11.3.0

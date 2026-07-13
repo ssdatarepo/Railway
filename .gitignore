@@ -1,0 +1,7 @@
+# Block cookies and local project json credentials
+ss.json
+tracxn_session.json
+.env
+.venv/
+__pycache__/
+*.pyc
