@@ -66,6 +66,7 @@ import threading
 import requests
 import PyPDF2
 import gspread
+
 try:
     # PyMuPDF's newer canonical import name -- avoids a name collision with
     # an unrelated PyPI package that is also literally called "fitz".
@@ -85,12 +86,6 @@ from playwright.sync_api import sync_playwright
 from google.oauth2.service_account import Credentials
 
 # ---------------- CONFIG ----------------
-# SERVICE_ACCOUNT_FILE = "/Users/vinay/Desktop/json/ss.json"
-#
-# INPUT_SPREADSHEET_ID = "1siNgkqlYwQpROQbf6mp8uIKXmyvCg3oFm8_L32PiJZw"
-# INPUT_SHEET_NAME = "Altered MOA"
-#
-# SESSION_FILE = "tracxn_session.json"  # created by login_and_save_session.py
 
 GOOGLE_SERVICE_ACCOUNT_INFO = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
 TRACXN_SESSION_DATA = json.loads(os.environ["TRACXN_SESSION_JSON"])
@@ -142,7 +137,7 @@ STATUS_CLAUSE_MATCHED = "clause 3a"
 STATUS_FULL_EXTRACT = "Full Extract"
 STATUS_NONE = ""
 
-PREFETCH_WORKERS = 8    # parallel threads used for the fast direct-download pass
+PREFETCH_WORKERS = 8  # parallel threads used for the fast direct-download pass
 INPUT_BATCH_SIZE = 100  # how many input rows to read/process/write at a time
 EXTRACTION_WORKERS = 25  # parallel threads used to extract/parse documents per batch
 
@@ -170,9 +165,9 @@ def call_with_retry(func, *args, **kwargs):
         try:
             return func(*args, **kwargs)
         except (
-            requests.exceptions.RequestException,
-            OSError,
-            gspread.exceptions.APIError,
+                requests.exceptions.RequestException,
+                OSError,
+                gspread.exceptions.APIError,
         ) as e:
             last_exc = e
             if attempt == SHEETS_MAX_RETRIES:
@@ -203,10 +198,8 @@ def gspread_auth():
 
 def load_cookies_from_session():
     cookie_dict = {}
-
     for c in TRACXN_SESSION_DATA["cookies"]:
         cookie_dict[c["name"]] = str(c["value"])
-
     return cookie_dict
 
 
@@ -368,7 +361,7 @@ def is_scanned_photo_pdf(text: str) -> bool:
 
 # ---------------- OCR FALLBACK (for scanned/photo PDFs) ----------------
 
-OCR_DPI = 300          # higher = more accurate OCR but slower/more memory
+OCR_DPI = 300  # higher = more accurate OCR but slower/more memory
 OCR_LANGUAGE = "eng"
 
 # If `tesseract --version` works in your terminal but the script still can't
@@ -435,7 +428,7 @@ def extract_main_objects(text: str) -> str:
         if idx == -1:
             idx = norm.lower().find("object")
         if idx != -1:
-            print(f"    [debug] Nearby text: ...{norm[max(0, idx-30):idx+200]}...")
+            print(f"    [debug] Nearby text: ...{norm[max(0, idx - 30):idx + 200]}...")
         else:
             print(f"    [debug] 'object' not found anywhere in extracted text "
                   f"({len(norm)} chars total). PDF text extraction may have failed.")
@@ -477,7 +470,7 @@ def build_extraction_result(raw_text: str) -> tuple:
 
 
 def extract_doc_text_parallel(context, cookies: dict, browser_lock: threading.Lock,
-                               doc_url: str, prefetched_bytes: bytes = None) -> tuple:
+                              doc_url: str, prefetched_bytes: bytes = None) -> tuple:
     """Thread-safe extraction pipeline for use inside a ThreadPoolExecutor.
 
     Playwright's sync API is NOT thread-safe, so any call that touches the
@@ -589,8 +582,8 @@ def parse_header(header_row):
     missing = [h for h in required if h not in indices]
     if missing:
         raise ValueError(f"Could not find column(s) {missing} in header row: {header_row}. "
-                          f"Make sure the sheet has an '{STATUS_HEADER}' column (col F) "
-                          f"in addition to '{EXTRACTION_HEADER}' (col E).")
+                         f"Make sure the sheet has an '{STATUS_HEADER}' column (col F) "
+                         f"in addition to '{EXTRACTION_HEADER}' (col E).")
 
     return indices
 
@@ -613,7 +606,7 @@ def col_num_to_letter(n: int) -> str:
 # ---------------- IN-PLACE COLUMN WRITE ----------------
 
 def write_column_values(input_sheet, batch_start, batch_end, col_idx,
-                         chunk_rows, new_values_by_row, label):
+                        chunk_rows, new_values_by_row, label):
     """Writes a single column back for rows batch_start..batch_end.
     Rows present in new_values_by_row get their freshly computed value;
     any other row in the range keeps whatever was already in that cell
@@ -640,7 +633,10 @@ def write_column_values(input_sheet, batch_start, batch_end, col_idx,
 
 def process_sheet():
     client = gspread_auth()
-    input_sheet = client.open_by_key(INPUT_SPREADSHEET_ID).worksheet(INPUT_SHEET_NAME)
+
+    # [FIX] Wrap both API calls in your retry logic to handle 429 Quota Exceeded errors
+    spreadsheet = call_with_retry(client.open_by_key, INPUT_SPREADSHEET_ID)
+    input_sheet = call_with_retry(spreadsheet.worksheet, INPUT_SHEET_NAME)
 
     header_row = call_with_retry(input_sheet.row_values, 1)
     if not header_row:
