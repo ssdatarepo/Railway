@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+# Force Python to unbuffer stdout/stderr so logs show up immediately
+ENV PYTHONUNBUFFERED=1
+
 # System deps: tesseract for pytesseract OCR, and libs Playwright's Chromium needs
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
