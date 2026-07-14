@@ -193,10 +193,8 @@ def gspread_auth():
         "https://www.googleapis.com/auth/drive",
     ]
 
-    credentials_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-
     creds = Credentials.from_service_account_info(
-        credentials_info,
+        GOOGLE_SERVICE_ACCOUNT_INFO,
         scopes=scope
     )
 
@@ -204,11 +202,9 @@ def gspread_auth():
 
 
 def load_cookies_from_session():
-    storage = json.loads(os.environ["TRACXN_SESSION_JSON"])
-
     cookie_dict = {}
 
-    for c in storage["cookies"]:
+    for c in TRACXN_SESSION_DATA["cookies"]:
         cookie_dict[c["name"]] = str(c["value"])
 
     return cookie_dict
@@ -659,7 +655,8 @@ def process_sheet():
     print(f"Header parsed: CIN col {cin_idx}, Link col {link_idx}, "
           f"extraction col {extraction_idx}, extraction_status col {status_idx}")
 
-    cookies = load_cookies_from_session(SESSION_FILE)
+    # No arguments needed now; it pulls directly from TRACXN_SESSION_DATA
+    cookies = load_cookies_from_session()
 
     last_col_needed = max(indices.values())
     last_col_letter = col_num_to_letter(last_col_needed + 1)
@@ -670,7 +667,8 @@ def process_sheet():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(storage_state=SESSION_FILE)
+        # Passing the TRACXN_SESSION_DATA dictionary directly into storage_state
+        context = browser.new_context(storage_state=TRACXN_SESSION_DATA)
         browser_lock = threading.Lock()
 
         current_row = 2  # first data row (row 1 is header)
