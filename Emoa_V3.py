@@ -8,19 +8,17 @@ import threading
 import requests
 import PyPDF2
 import gspread
+
 try:
-    # PyMuPDF's newer canonical import name -- avoids a name collision with
-    # an unrelated PyPI package that is also literally called "fitz".
+    # PyMuPDF's newer canonical import name
     import pymupdf as fitz
 except ImportError:
-    import fitz  # PyMuPDF -- rasterizes PDF pages to images for OCR
+    import fitz  # PyMuPDF
+
 import pytesseract
 from PIL import Image
 
-# We rasterize our own PDFs at high DPI for OCR accuracy -- large-format
-# pages (A2/A3-sized scans, etc.) at 300 DPI can legitimately exceed PIL's
-# default decompression-bomb pixel threshold. This isn't an untrusted image
-# upload, so it's safe to disable that safety cap here.
+# Disable the safety cap for high DPI PDF rasterization
 Image.MAX_IMAGE_PIXELS = None
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright
@@ -33,13 +31,6 @@ TRACXN_SESSION_DATA = json.loads(os.environ["TRACXN_SESSION_JSON"])
 INPUT_SPREADSHEET_ID = os.environ["SHEET_ID"]
 INPUT_SHEET_NAME = "Altered MOA"
 
-# MOA documents phrase the "Objects" clause boundary differently depending on
-# the era/format of the filing. START_MARKERS and END_MARKERS below list every
-# known variant seen so far (leading numbering like "3 (a)", "III.", trailing
-# punctuation/labels like ":", "3rd (a) are:", "(A)" are deliberately left out
-# of these core phrases -- they're not needed for matching since we only
-# search for the core phrase itself, wherever it sits in the surrounding
-# numbering/punctuation).
 START_MARKERS = [
     "MEMORANDUM OF ASSOCIATION OF A COMPANY LIMITED BY SHARES"
 ]
@@ -57,28 +48,26 @@ END_MARKERS = [
     "Objects, ancillary or",
 ]
 
-# Column header names as they appear in row 1 of the input sheet
+# Column header names
 CIN_HEADER = "CIN"
 DISPLAY_NAME_HEADER = "Display Name"
 DATE_HEADER = "Date"
 LINK_HEADER = "Link"
 EXTRACTION_HEADER = "extraction"
-STATUS_HEADER = "extraction_status"  # NEW -- col F: "clause 3a" / "Full Extract" / ""
+STATUS_HEADER = "extraction_status"
 
-# Status labels written to the STATUS_HEADER column
+# Status labels
 STATUS_CLAUSE_MATCHED = "clause 3a"
 STATUS_FULL_EXTRACT = "Full Extract"
 STATUS_NONE = ""
 
-PREFETCH_WORKERS = 8    # parallel threads used for the fast direct-download pass
-INPUT_BATCH_SIZE = 100  # how many input rows to read/process/write at a time
-EXTRACTION_WORKERS = 25  # parallel threads used to extract/parse documents per batch
+PREFETCH_WORKERS = 8
+INPUT_BATCH_SIZE = 100
+EXTRACTION_WORKERS = 25
 
-# Retry settings for Google Sheets API calls, which can fail transiently
-# due to local network drops ("No route to host"), DNS hiccups, Google-side
-# rate limiting (APIError 429), or brief outages (5xx).
+# Retry settings
 SHEETS_MAX_RETRIES = 5
-SHEETS_RETRY_BASE_DELAY = 5  # seconds; doubles each retry (5, 10, 20, 40, 80)
+SHEETS_RETRY_BASE_DELAY = 5
 # -----------------------------------------
 
 USER_AGENT = (
@@ -86,13 +75,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
-
 def call_with_retry(func, *args, **kwargs):
-    """Calls func(*args, **kwargs), retrying on transient network/API
-    failures with exponential backoff. Used to wrap every Google Sheets API
-    call so a brief network drop (e.g. 'No route to host') or a momentary
-    Sheets API error doesn't kill an entire run after expensive extraction
-    work has already been done for that batch."""
     last_exc = None
     for attempt in range(1, SHEETS_MAX_RETRIES + 1):
         try:
@@ -120,25 +103,14 @@ def gspread_auth():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    # Use the dictionary parsed from the environment variable
+    # FIX: Use the dictionary loaded from os.environ
     creds = Credentials.from_service_account_info(GOOGLE_SERVICE_ACCOUNT_INFO, scopes=scope)
     return gspread.authorize(creds)
 
 
-def load_cookies_from_session(session_file: str) -> dict:
-    """Load cookies out of a Playwright storage_state JSON file, in a form
-    usable directly by the `requests` library."""
-    with open(session_file, "r") as f:
-        state = json.load(f)
-    return {c["name"]: c["value"] for c in state.get("cookies", [])}
-
-
-# ---------------- PDF FETCHING (unchanged logic) ----------------
+# ---------------- PDF FETCHING ----------------
 
 def try_direct_download(url: str, cookies: dict):
-    """Fast path: a plain HTTP GET with the session cookies attached. Works
-    for direct download links (e.g. /fm/dl/...). Returns a BytesIO if it
-    got a real PDF, or None if it didn't (so we can fall back to Playwright)."""
     try:
         response = requests.get(
             url,
@@ -155,8 +127,6 @@ def try_direct_download(url: str, cookies: dict):
 
 
 def looks_like_pdf_response(response) -> bool:
-    """Heuristics to spot the response that actually carries the PDF, without
-    needing to know the exact endpoint in advance."""
     url = response.url
     content_type = response.headers.get("content-type", "")
     if "application/pdf" in content_type:
@@ -169,16 +139,13 @@ def looks_like_pdf_response(response) -> bool:
 
 
 def fetch_pdf_via_direct_download(context, doc_url: str) -> io.BytesIO:
-    """For /fm/dl/... links opened in a real browser: the browser treats
-    these as a direct file download rather than a page load, so we capture
-    it via the download event instead of page.goto()."""
     page = context.new_page()
     try:
         with page.expect_download(timeout=60000) as download_info:
             try:
                 page.goto(doc_url, timeout=60000)
             except Exception:
-                pass  # goto() raises because navigation turned into a download -- expected
+                pass
         download = download_info.value
         download_path = download.path()
         with open(download_path, "rb") as f:
@@ -195,8 +162,6 @@ def fetch_pdf_via_direct_download(context, doc_url: str) -> io.BytesIO:
 
 
 def fetch_pdf_via_page(context, doc_url: str) -> io.BytesIO:
-    """Loads the document page in a real browser tab and captures whichever
-    network response turns out to be the actual PDF."""
     if "/fm/dl/" in doc_url:
         return fetch_pdf_via_direct_download(context, doc_url)
 
@@ -230,10 +195,6 @@ def fetch_pdf_via_page(context, doc_url: str) -> io.BytesIO:
 
 
 def fetch_pdf(context, cookies: dict, doc_url: str, prefetched_bytes: bytes = None) -> io.BytesIO:
-    """Tries the fast plain-HTTP path first; falls back to a real browser
-    only if that doesn't yield a real PDF. If prefetched_bytes is provided
-    (from the parallel prefetch pass), skips the direct-download attempt
-    entirely since it's already known to have succeeded."""
     if prefetched_bytes is not None:
         return io.BytesIO(prefetched_bytes)
 
@@ -246,68 +207,38 @@ def fetch_pdf(context, cookies: dict, doc_url: str, prefetched_bytes: bytes = No
     return fetch_pdf_via_page(context, doc_url)
 
 
-# ---------------- PDF TEXT EXTRACTION (unchanged logic) ----------------
+# ---------------- PDF TEXT EXTRACTION ----------------
 
 PLACEHOLDER_SIGNATURE = "If this message is not eventually replaced by the proper contents"
-
-# If PyPDF2 pulls out fewer than this many non-whitespace characters across
-# the whole document, treat it as a scanned/photo PDF (no real text layer --
-# i.e. the page images were never OCR'd) rather than a "markers not found"
-# case.
 MIN_TEXT_CHARS_FOR_TEXT_PDF = 30
-
-# Google Sheets hard-caps a single cell at 50,000 characters. Stay safely
-# under that so a long "Objects" clause (or the full-document fallback text)
-# doesn't crash the write with a 400 error.
 MAX_CELL_CHARS = 49500
 TRUNCATION_SUFFIX = " ...[TRUNCATED -- exceeded Google Sheets 50,000 char cell limit]"
 
-
 def truncate_for_sheet_cell(text: str) -> str:
-    """Clips text so it fits in a single Google Sheets cell, appending a
-    visible marker if it had to cut anything."""
     if len(text) <= MAX_CELL_CHARS:
         return text
     cutoff = MAX_CELL_CHARS - len(TRUNCATION_SUFFIX)
     return text[:cutoff] + TRUNCATION_SUFFIX
 
-
 def is_unsupported_xfa_placeholder(text: str) -> bool:
-    """Some PDFs are dynamic XFA forms with no real extractable text -- just
-    a placeholder telling you your viewer can't render them. Detect that so
-    we can report it clearly instead of a confusing 'markers not found'."""
     return PLACEHOLDER_SIGNATURE.lower() in text.lower()
 
-
 def is_scanned_photo_pdf(text: str) -> bool:
-    """A scanned/photographed document (no embedded text layer) will yield
-    little to no text from PyPDF2's extraction -- as opposed to a normal
-    text-based PDF where the Objects clause just doesn't match our markers.
-    Distinguishing the two lets us report 'Photo pdf' instead of a
-    misleading full-text dump."""
     non_whitespace_chars = len(re.sub(r"\s+", "", text))
     return non_whitespace_chars < MIN_TEXT_CHARS_FOR_TEXT_PDF
 
 
-# ---------------- OCR FALLBACK (for scanned/photo PDFs) ----------------
+# ---------------- OCR FALLBACK ----------------
 
-OCR_DPI = 300          # higher = more accurate OCR but slower/more memory
+OCR_DPI = 300
 OCR_LANGUAGE = "eng"
-
-# If `tesseract --version` works in your terminal but the script still can't
-# find it (e.g. a venv/IDE not inheriting your shell's PATH), uncomment and
-# set this to the exact path from `which tesseract`:
-pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
-
+# pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
 
 def ocr_pdf_bytes(pdf_bytes: bytes) -> str:
-    """Rasterizes every page of a PDF (via PyMuPDF) and runs Tesseract OCR
-    on each page image, concatenating the results. Used as a fallback for
-    scanned/photographed documents that have no embedded text layer."""
     text_parts = []
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        zoom = OCR_DPI / 72  # fitz's default render is 72 DPI
+        zoom = OCR_DPI / 72
         matrix = fitz.Matrix(zoom, zoom)
         for page in doc:
             pix = page.get_pixmap(matrix=matrix)
@@ -333,14 +264,6 @@ def extract_pdf_text(pdf_file: io.BytesIO) -> str:
 
 
 def extract_main_objects(text: str) -> str:
-    """Extract text between the earliest matching start marker and the
-    earliest following end marker, tolerant of the inconsistent
-    whitespace/line-breaks PDF extraction tends to introduce. Tries every
-    known phrasing variant in START_MARKERS / END_MARKERS -- MOA documents
-    from different eras/formats word this boundary differently.
-
-    Returns "" if no start/end marker pair matched."""
-
     def to_flexible_pattern(marker: str) -> str:
         return r"\s+".join(re.escape(word) for word in marker.split())
 
@@ -367,13 +290,6 @@ def extract_main_objects(text: str) -> str:
 
 
 def build_extraction_result(raw_text: str) -> tuple:
-    """Given the full extracted (or OCR'd) text of a document, decides what
-    goes into the `extraction` column and the `extraction_status` column.
-
-    Returns (extraction_value, status_value):
-      - markers matched      -> (isolated Objects clause, "clause 3a")
-      - markers didn't match -> (full raw text,            "Full Extract")
-    """
     objects_text = extract_main_objects(raw_text)
     if objects_text:
         return objects_text, STATUS_CLAUSE_MATCHED
@@ -384,27 +300,13 @@ def build_extraction_result(raw_text: str) -> tuple:
 
 def extract_doc_text_parallel(context, cookies: dict, browser_lock: threading.Lock,
                                doc_url: str, prefetched_bytes: bytes = None) -> tuple:
-    """Thread-safe extraction pipeline for use inside a ThreadPoolExecutor.
-
-    Playwright's sync API is NOT thread-safe, so any call that touches the
-    shared `context`/browser (i.e. the Playwright fallback path) must be
-    serialized via `browser_lock`. Everything else -- prefetched bytes
-    already in memory, or a fresh plain-HTTP direct-download attempt, plus
-    all PDF parsing/regex/OCR work -- is pure Python and safe to run fully
-    in parallel across threads without holding the lock.
-
-    Returns (extraction_value, status_value) -- see build_extraction_result()
-    and the module docstring for what each status value means."""
     if prefetched_bytes is not None:
         pdf_bytes = prefetched_bytes
     else:
-        # Try a fresh direct download first -- still just plain HTTP via
-        # `requests`, so no lock needed here either.
         pdf_file = try_direct_download(doc_url, cookies)
         if pdf_file is not None:
             pdf_bytes = pdf_file.getvalue()
         else:
-            # Only the actual browser fallback needs to be serialized.
             with browser_lock:
                 pdf_file = fetch_pdf_via_page(context, doc_url)
             pdf_bytes = pdf_file.getvalue()
@@ -415,7 +317,6 @@ def extract_doc_text_parallel(context, cookies: dict, browser_lock: threading.Lo
         return "Content not available", STATUS_NONE
 
     if is_scanned_photo_pdf(pdf_text):
-        # No embedded text layer -- fall back to OCR on the rasterized pages.
         try:
             ocr_text = ocr_pdf_bytes(pdf_bytes)
         except Exception as e:
@@ -423,8 +324,6 @@ def extract_doc_text_parallel(context, cookies: dict, browser_lock: threading.Lo
             return "Photo pdf", STATUS_NONE
 
         if is_scanned_photo_pdf(ocr_text):
-            # OCR also came back essentially empty -- genuinely unreadable
-            # scan (blank page, too low quality, etc.), not a code failure.
             return "Photo pdf", STATUS_NONE
 
         return build_extraction_result(ocr_text)
@@ -433,11 +332,6 @@ def extract_doc_text_parallel(context, cookies: dict, browser_lock: threading.Lo
 
 
 def prefetch_direct_downloads(links, cookies: dict) -> dict:
-    """Attempts the fast plain-HTTP download for many links concurrently.
-    Pure network I/O with no browser involved, so this is safe to
-    parallelize. Returns {link: bytes} for links that succeeded; links
-    that fail (need the Playwright fallback) are simply absent from the
-    returned dict."""
     results = {}
     if not links:
         return results
@@ -472,9 +366,6 @@ def prefetch_direct_downloads(links, cookies: dict) -> dict:
 # ---------------- HEADER PARSING ----------------
 
 def parse_header(header_row):
-    """Finds the column index of each expected header, by name, so column
-    order in the sheet doesn't matter. Raises if any required header is
-    missing."""
     indices = {}
     for i, col in enumerate(header_row):
         name = col.strip()
@@ -508,7 +399,6 @@ def safe_get(row, idx):
 # ---------------- COLUMN LETTER HELPER ----------------
 
 def col_num_to_letter(n: int) -> str:
-    """1-indexed column number -> A1-style column letter(s)."""
     letters = ""
     while n > 0:
         n, remainder = divmod(n - 1, 26)
@@ -520,10 +410,6 @@ def col_num_to_letter(n: int) -> str:
 
 def write_column_values(input_sheet, batch_start, batch_end, col_idx,
                          chunk_rows, new_values_by_row, label):
-    """Writes a single column back for rows batch_start..batch_end.
-    Rows present in new_values_by_row get their freshly computed value;
-    any other row in the range keeps whatever was already in that cell
-    (so skipped/already-processed/blank rows are left untouched)."""
     col_letter = col_num_to_letter(col_idx + 1)
     values = []
     for offset, sheet_row in enumerate(range(batch_start, batch_end + 1)):
@@ -561,21 +447,22 @@ def process_sheet():
     print(f"Header parsed: CIN col {cin_idx}, Link col {link_idx}, "
           f"extraction col {extraction_idx}, extraction_status col {status_idx}")
 
-    cookies = load_cookies_from_session(SESSION_FILE)
+    # FIX: Parse cookies directly from the TRACXN_SESSION_DATA dictionary
+    cookies = {c["name"]: c["value"] for c in TRACXN_SESSION_DATA.get("cookies", [])}
 
     last_col_needed = max(indices.values())
     last_col_letter = col_num_to_letter(last_col_needed + 1)
-    total_rows_in_sheet = input_sheet.row_count  # includes header + possible trailing blank rows
+    total_rows_in_sheet = input_sheet.row_count
 
-    # doc_link -> (extraction_value, status_value), shared across all batches
     extracted_result_cache = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(storage_state=SESSION_FILE)
+        # FIX: Pass the dictionary directly as storage_state
+        context = browser.new_context(storage_state=TRACXN_SESSION_DATA)
         browser_lock = threading.Lock()
 
-        current_row = 2  # first data row (row 1 is header)
+        current_row = 2
         while current_row <= total_rows_in_sheet:
             batch_start = current_row
             batch_end = min(current_row + INPUT_BATCH_SIZE - 1, total_rows_in_sheet)
@@ -584,17 +471,12 @@ def process_sheet():
             chunk_rows = call_with_retry(input_sheet.get, range_name)
 
             if not chunk_rows:
-                # No more data at all -- stop.
                 break
 
             print(f"\n=== Batch: input rows {batch_start}-{batch_end} "
                   f"({len(chunk_rows)} fetched) ===")
 
-            # ---- Pass 1 (in-memory): figure out which rows in this chunk
-            # need extracting. A row is skipped if it has no CIN (trailing
-            # blank row), no Link (nothing to extract), or already has a
-            # non-empty `extraction` value (resume support).
-            row_infos = []  # (sheet_row_number, link)
+            row_infos = []
             unique_links = set()
             any_data_in_chunk = False
             skipped_already_processed = 0
@@ -621,7 +503,6 @@ def process_sheet():
                 unique_links.add(link)
 
             if not any_data_in_chunk:
-                # Reached trailing blank rows -- nothing left to process.
                 print("  No CIN values found in this batch -- stopping.")
                 break
 
@@ -632,8 +513,6 @@ def process_sheet():
                 print(f"  Skipping {skipped_no_link} row(s) with no Link value.")
 
             if not row_infos:
-                # Everything in this chunk was already processed or had no
-                # link -- move on without touching prefetch/extraction/output.
                 print("  Nothing new to process in this batch.")
                 current_row = batch_end + 1
                 continue
@@ -641,15 +520,8 @@ def process_sheet():
             print(f"  {len(row_infos)} document rows in this batch; "
                   f"{len(unique_links)} unique documents to extract.")
 
-            # ---- Pass 2: prefetch this batch's unique links in parallel.
             prefetch_cache = prefetch_direct_downloads(unique_links, cookies)
 
-            # ---- Pass 3: extract every not-yet-cached unique document in
-            # this batch, up to EXTRACTION_WORKERS at a time. Most docs hit
-            # the prefetch cache (or a fresh direct download), which is
-            # pure in-memory/HTTP work and runs fully in parallel; only the
-            # rare Playwright fallback is serialized via browser_lock inside
-            # extract_doc_text_parallel.
             docs_to_extract = sorted(
                 link for link in unique_links if link not in extracted_result_cache
             )
@@ -679,8 +551,6 @@ def process_sheet():
                         if done % 10 == 0 or done == len(docs_to_extract):
                             print(f"    Extraction progress: {done}/{len(docs_to_extract)}")
 
-            # ---- Pass 4: assemble the new extraction/status values per row
-            # from the (now fully populated) result cache. Pure in-memory work.
             new_extraction_values = {}
             new_status_values = {}
             for sheet_row_number, link in row_infos:
@@ -690,8 +560,6 @@ def process_sheet():
                 new_extraction_values[sheet_row_number] = truncate_for_sheet_cell(extract_text)
                 new_status_values[sheet_row_number] = status_value
 
-            # ---- Write this batch's `extraction` and `extraction_status`
-            # values in-place before moving to the next chunk of input rows.
             write_column_values(
                 input_sheet, batch_start, batch_end, extraction_idx,
                 chunk_rows, new_extraction_values, EXTRACTION_HEADER,
@@ -706,7 +574,6 @@ def process_sheet():
         browser.close()
 
     print("\nDone.")
-
 
 if __name__ == "__main__":
     process_sheet()
